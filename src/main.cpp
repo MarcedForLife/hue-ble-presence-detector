@@ -22,6 +22,7 @@ static bool doConnect = false;
 static bool connected = false;
 static bool bulbOn = false;
 static bool detectedState = false;
+static bool sensingPaused = false;
 
 class ClientCallbacks : public NimBLEClientCallbacks {
     void onConnect(NimBLEClient* pClient) {
@@ -101,8 +102,18 @@ void notifyCB(NimBLERemoteCharacteristic* pRemoteCharacteristic, uint8_t* pData,
         Log.infoln("Received power state notification from bulb '%s'. The bulb is now %s",
             pRemoteCharacteristic->getRemoteService()->getClient()->getPeerAddress().toString().c_str(),
             storeBulbState(pData) ? "on" : "off");
+        if (PAUSE_ON_EXTERNAL_CONTROL && bulbOn != detectedState || sensingPaused) {
+            Log.infoln("The bulb was externally controlled and 'PAUSE_ON_EXTERNAL_CONTROL' was enabled.");
+            if (!sensingPaused) {
+                Log.infoln("Sensor control will be **paused** until we detect a second instance of external power control");
+                sensingPaused = true;
+            } else {
+                Log.infoln("Sensor control will **resume** as this is the second instance of external power control");
+                sensingPaused = false;
+            }
+        }
     } else {
-        Log.infoln("Received an unknown notification from bulb '%s', service '%s' & characteristic '%s'. Value: '%u'",
+        Log.infoln("Received an unknown notification from device '%s', service '%s' & characteristic '%s'. Value: '%u'",
             pRemoteCharacteristic->getRemoteService()->getClient()->getPeerAddress().toString().c_str(),
             pRemoteCharacteristic->getRemoteService()->getUUID().toString().c_str(),
             pRemoteCharacteristic->getUUID().toString().c_str(),
@@ -298,7 +309,7 @@ void loop() {
     // While we are connected to a bulb, toggle it on and off based on presence
     while (connected) {
         bool detected = sensor.readPresenceDetection();
-        if (detected != detectedState) {
+        if (detected != detectedState && !sensingPaused) {
             Log.infoln("Presence state changed, new state: %s", detected ? "Present" : "Absent");
             changeBulbState(detectedState = detected);
         }

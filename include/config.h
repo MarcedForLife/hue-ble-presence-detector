@@ -27,4 +27,11 @@ const float SENSOR_DISTANCE_END = 4.0;
 const float SENSOR_PRESENCE_LATENCY = 0.0;
 const float SENSOR_ABSENCE_LATENCY = 5.0;
 
+/* 
+ Enabling this stops the sensor from controlling the bulb if it detects that the bulb was turned on/off by something else.
+ The sensor will resume control once it detects that the bulb has been turned back on/off.
+ This is useful if used in a bedroom and occupants don't want the bulb accidentally turning on while sleeping.
+*/
+const bool PAUSE_ON_EXTERNAL_CONTROL = false;
+
 #endif
