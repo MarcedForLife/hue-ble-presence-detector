@@ -13,8 +13,16 @@
 */
 const int LOG_LEVEL = 5;
 
-// The MAC address of the bulb you want to control
-const std::string BULB_MAC_ADDRESS = "fe:2e:97:4e:16:ba";
+/*
+  The MAC addresses of the bulbs you want to control.
+
+  Note that from searching, the ESP32 controller has a limit of 9 devices
+  but CONFIG_BT_NIMBLE_MAX_CONNECTIONS has a default of 3.
+  So increase as needed.
+*/
+const std::string BULB_MAC_ADDRESSES[2] = {
+    "fe:2e:97:4e:16:ba",
+    "fe:2e:97:4e:16:bb"};
 
 // Configures the range at which the mmWave sensor starts and ends in meters (max 9m)
 const float SENSOR_DISTANCE_START = 0.0;
