@@ -13,8 +13,16 @@
 */
 const int LOG_LEVEL = 5;
 
-// The MAC address of the bulb you want to control
-const std::string BULB_MAC_ADDRESS = "fe:2e:97:4e:16:ba";
+/*
+  The MAC addresses of the bulb(s) you want to control.
+
+  Note that from searching, the ESP32 controller has a limit of 9 devices
+  but CONFIG_BT_NIMBLE_MAX_CONNECTIONS has a default of 3.
+  So increase as needed.
+*/
+const std::string BULB_MAC_ADDRESSES[2] = {
+    "fe:2e:97:4e:16:ba",
+    "fe:2e:97:4e:16:bb"};
 
 // Configures the range at which the mmWave sensor starts and ends in meters (max 9m)
 const float SENSOR_DISTANCE_START = 0.0;
@@ -28,10 +36,10 @@ const float SENSOR_PRESENCE_LATENCY = 0.0;
 const float SENSOR_ABSENCE_LATENCY = 5.0;
 
 /* 
- Enabling this stops the sensor from controlling the bulb if it detects that the bulb was turned on/off by something else.
- The sensor will resume control once it detects that the bulb has been turned back on/off.
+ Enabling this stops the sensor from controlling a bulb if it detects that that bulb was turned on/off by something else.
+ The sensor will resume control once it detects that same bulb has been turned back on/off.
  This is useful if used in a bedroom and occupants don't want the bulb accidentally turning on while sleeping.
 */
-const bool PAUSE_ON_EXTERNAL_CONTROL = false;
+const bool PAUSE_ON_EXTERNAL_CONTROL = true;
 
 #endif
