@@ -2,6 +2,7 @@
  This file contains code for the Hue BLE presence detector.
 */
 
+#include <map>
 #include <config.h>
 #include <ArduinoLog.h>
 #include <NimBLEDevice.h>
@@ -9,20 +10,29 @@
 
 static const NimBLEUUID LIGHT_SERVICE_UUID = NimBLEUUID("932c32bd-0000-47a2-835a-a8d455b859dd");
 static const NimBLEUUID POWER_STATE_CHAR_UUID = NimBLEUUID("932c32bd-0002-47a2-835a-a8d455b859dd");
-static const uint32_t SCAN_LENGTH = 0; // 0 = scan forever
-
-static NimBLEAdvertisedDevice* advDevice;
-static NimBLERemoteService* lightService;
-static NimBLERemoteCharacteristic* powerStateChar;
+/*
+ How long in seconds to scan for. If set to 0, the scan will run forever.
+ However, if non-zero the current code will just start the scan again if there are unconnected bulbs.
+*/
+const uint32_t SCAN_LENGTH = 0;
 
 static HardwareSerial mySerial(1);
 static DFRobot_mmWave_Radar sensor(&mySerial);
 
-static bool doConnect = false;
-static bool connected = false;
-static bool bulbOn = false;
 static bool detectedState = false;
-static bool sensingPaused = false;
+static int connectedBulbs = 0;
+
+struct BulbData {
+    NimBLEAdvertisedDevice* advDevice;
+    NimBLERemoteService* lightService;
+    NimBLERemoteCharacteristic* powerStateChar;
+    bool connected;
+    bool poweredOn;
+    bool paused;
+};
+
+static std::map<std::string, BulbData*> bulbs;
+static BulbData* bulbToConnect;
 
 class ClientCallbacks : public NimBLEClientCallbacks {
     void onConnect(NimBLEClient* pClient) {
@@ -37,12 +47,13 @@ class ClientCallbacks : public NimBLEClientCallbacks {
     };
 
     void onDisconnect(NimBLEClient* pClient) {
-        // Reset our local state variables
-        connected = false;
-        doConnect = false;
+        std::string bulbAddress = pClient->getPeerAddress().toString();
+        Log.warningln("Disconnected from the bulb '%s'", bulbAddress.c_str());
 
-        Log.warningln("%s Disconnected, starting scan", pClient->getPeerAddress().toString().c_str());
-        NimBLEDevice::getScan()->start(SCAN_LENGTH);
+        // Reset our local state variables
+        BulbData* disconnectedBulb = bulbs.find(bulbAddress)->second;
+        disconnectedBulb->connected = false;
+        connectedBulbs--;
     };
 
     /*
@@ -64,52 +75,77 @@ class ClientCallbacks : public NimBLEClientCallbacks {
     };
 };
 
-
 // Define a class to handle the callbacks when advertisements are received
 class AdvertisedDeviceCallbacks: public NimBLEAdvertisedDeviceCallbacks {
     void onResult(NimBLEAdvertisedDevice* advertisedDevice) {
         Log.traceln("Advertised device found: %s", advertisedDevice->toString().c_str());
-        if (advertisedDevice->getAddress().toString() == BULB_MAC_ADDRESS) {
-            Log.infoln("Found our configured bulb!");
-            // Stop scan before connecting
+        std::string deviceAddress = advertisedDevice->getAddress().toString();
+        if (bulbs.count(deviceAddress)) {
+            Log.infoln("Found a configured bulb!");
+            // NimBLE cannot scan and connect at the same time, so stop scanning now
             NimBLEDevice::getScan()->stop();
-            // Save the device reference in a global for the client to use
-            advDevice = advertisedDevice;
-            // Ready to connect now
-            doConnect = true;
+            // Save reference to the device in the appropriate bulb data
+            BulbData* bulb = bulbs.find(deviceAddress)->second;
+            bulb->advDevice = advertisedDevice;
+            // We can't connect from here due to API blocking calls, so instead save a reference for the main loop to do it
+            bulbToConnect = bulb;
         }
     }
 };
 
 // This will update our local variable for the bulb power state
-bool storeBulbState(const uint8_t* bulbData) {
-    return bulbOn = bulbData[0] == 1;
+bool storeBulbState(std::string bulbAddress, const uint8_t* bulbData) {
+    bool poweredOn = bulbData[0] == 1;
+    bulbs.find(bulbAddress)->second->poweredOn = poweredOn;
+    return poweredOn;
 }
 
-// Changes the connected bulb power state (if connected)
-bool changeBulbState(bool on) {
-    if (powerStateChar && powerStateChar->canWrite()) {
-        if (on != bulbOn && powerStateChar->writeValue(on ? byte(1) : byte(0))) {
-            Log.noticeln("Turned the bulb %s", on ? "on" : "off");
+// Change the power state of the given bulb
+bool changeBulbState(BulbData* bulb, bool powerOn) {
+    // Check the state of the bulb first, which shouldn't count as failure
+    if (bulb->connected && !bulb->paused && powerOn != bulb->poweredOn) {
+        // These should all pass unless something is wrong
+        NimBLERemoteCharacteristic* powerStateChar = bulb->powerStateChar;
+        std::string bulbAddress = bulb->advDevice->getAddress().toString();
+        if (powerStateChar && powerStateChar->canWrite() && powerStateChar->writeValue(powerOn ? byte(1) : byte(0))) {
+            Log.noticeln("Turned the bulb '%s' %s", bulbAddress.c_str(), powerOn ? "on" : "off");
+            return true;
+        }
+        Log.errorln("There was an issue changing the power characteristic for the bulb '%s'",
+            bulbAddress.c_str());
+        return false;
+    }
+    return true;
+}
+
+// Changes the power states for connected, non-paused bulbs
+bool changeBulbStates(bool powerOn) {
+    bool allSucceeded = true;
+    for (auto& bulb : bulbs) {
+        if (!changeBulbState(bulb.second, powerOn)) {
+            Log.errorln("Failed to power the bulb '%s' %s", bulb.first.c_str(), powerOn ? "on": "off");
+            allSucceeded = false;
         }
     }
-    return false;
+    return allSucceeded;
 }
 
 // Notification / Indication receiving handler callback
 void notifyCB(NimBLERemoteCharacteristic* pRemoteCharacteristic, uint8_t* pData, size_t length, bool isNotify) {
     if (pRemoteCharacteristic->getUUID().equals(POWER_STATE_CHAR_UUID)) {
+        std::string bulbAddress = pRemoteCharacteristic->getRemoteService()->getClient()->getPeerAddress().toString();
+        // We shouldn't ever get a notification for a non-configured bulb, so don't bother with safety checks
+        BulbData* bulb = bulbs.find(bulbAddress)->second;
         Log.infoln("Received power state notification from bulb '%s'. The bulb is now %s",
-            pRemoteCharacteristic->getRemoteService()->getClient()->getPeerAddress().toString().c_str(),
-            storeBulbState(pData) ? "on" : "off");
-        if (PAUSE_ON_EXTERNAL_CONTROL && bulbOn != detectedState || sensingPaused) {
+            bulbAddress.c_str(), storeBulbState(bulbAddress, pData) ? "on" : "off");
+        if (PAUSE_ON_EXTERNAL_CONTROL && bulb->poweredOn != detectedState || bulb->paused) {
             Log.infoln("The bulb was externally controlled and 'PAUSE_ON_EXTERNAL_CONTROL' was enabled.");
-            if (!sensingPaused) {
+            if (!bulb->paused) {
                 Log.infoln("Sensor control will be **paused** until we detect a second instance of external power control");
-                sensingPaused = true;
+                bulb->paused = true;
             } else {
                 Log.infoln("Sensor control will **resume** as this is the second instance of external power control");
-                sensingPaused = false;
+                bulb->paused = false;
             }
         }
     } else {
@@ -127,14 +163,16 @@ static ClientCallbacks clientCB;
 // This ensures we are bonded to the given connected device
 bool ensureBonded(NimBLEClient* pClient) {
     bool bonded = BLEDevice::isBonded(pClient->getPeerAddress());
-    Log.traceln("Bond status: %s", bonded ? "bonded" : "not bonded");
+    std::string deviceAddress = pClient->getPeerAddress().toString();
+    Log.traceln("The bulb '%s' is currently %s", deviceAddress.c_str(), bonded ? "bonded" : "not bonded");
     if (!bonded) {
         Log.infoln("Bonding...");
+        NimBLEDevice::startSecurity(pClient->getPeerAddress());
         if (!pClient->secureConnection()) {
-            Log.errorln("Failed to bond!");
+            Log.errorln("Failed to bond with '%s'!", deviceAddress.c_str());
             return false;
         }
-        Log.infoln("Successfully bonded!");
+        Log.infoln("Successfully bonded with '%s'!", deviceAddress.c_str());
     }
     return true;
 }
@@ -159,7 +197,8 @@ bool initBulbNotifications(NimBLEClient* pClient, NimBLERemoteCharacteristic* po
 }
 
 // Handles the provisioning of clients and connects / interfaces with the bulb
-bool connectToBulb() {
+bool connectToBulb(BulbData* bulb) {
+    std::string bulbAddress = bulb->advDevice->getAddress().toString();
     NimBLEClient* pClient = nullptr;
 
     // Check if we have a client we should reuse first
@@ -169,13 +208,13 @@ bool connectToBulb() {
          second argument in connect() to prevent refreshing the service database.
          This saves considerable time and power.
         */
-        pClient = NimBLEDevice::getClientByPeerAddress(advDevice->getAddress());
+        pClient = NimBLEDevice::getClientByPeerAddress(bulb->advDevice->getAddress());
         if (pClient){
-            if (!pClient->connect(advDevice, false)) {
-                Log.errorln("Reconnect failed");
+            if (!pClient->connect(bulb->advDevice, false)) {
+                Log.errorln("Failed to reconnect to '%s'", bulbAddress.c_str());
                 return false;
             }
-            Log.infoln("Reconnected client!");
+            Log.infoln("Successfully reconnected to '%s'!", bulbAddress.c_str());
         }
         /*
          We don't already have a client that knows this device,
@@ -208,44 +247,44 @@ bool connectToBulb() {
         pClient->setConnectTimeout(5);
 
 
-        if (!pClient->connect(advDevice)) {
+        if (!pClient->connect(bulb->advDevice)) {
             // Created a client but failed to connect, don't need to keep it as it has no data
             NimBLEDevice::deleteClient(pClient);
-            Log.errorln("Failed to connect, deleted the client");
+            Log.errorln("Failed to connect to '%s', deleted the client", bulbAddress.c_str());
             return false;
         }
     }
 
     if (!pClient->isConnected()) {
-        if (!pClient->connect(advDevice)) {
-            Log.errorln("Failed to connect!");
+        if (!pClient->connect(bulb->advDevice)) {
+            Log.errorln("Failed to connect to '%s'!", bulbAddress.c_str());
             return false;
         }
     }
-
-    Log.infoln("Connected to: %s", pClient->getPeerAddress().toString().c_str());
-    Log.traceln("RSSI: %d", pClient->getRssi());
+    Log.traceln("Connected to: %s, RSSI: %d", bulbAddress.c_str(), pClient->getRssi());
+    connectedBulbs++;
 
     // To be able to read & write characteristics we need to be bonded to the bulb
     if (!ensureBonded(pClient)) {
         Log.errorln("We aren't bonded to the bulb '%s' which is required. See the readme for help",
-            pClient->getPeerAddress().toString().c_str());
+            bulbAddress.c_str());
+        NimBLEDevice::deleteClient(pClient);
         return false;
     }
 
     // Now we can read/write/subscribe the characteristics of the services we are interested in
-    lightService = pClient->getService(LIGHT_SERVICE_UUID);
-    if (lightService) {
-        powerStateChar = lightService->getCharacteristic(POWER_STATE_CHAR_UUID);
-        if (powerStateChar) {
-            if (powerStateChar->canRead()) {
-                storeBulbState(powerStateChar->readValue().data());
-                Log.infoln("The bulb is currently %s", bulbOn ? "on" : "off");
+    bulb->lightService = pClient->getService(LIGHT_SERVICE_UUID);
+    if (bulb->lightService) {
+        bulb->powerStateChar = bulb->lightService->getCharacteristic(POWER_STATE_CHAR_UUID);
+        if (bulb->powerStateChar) {
+            if (bulb->powerStateChar->canRead()) {
+                storeBulbState(bulbAddress, bulb->powerStateChar->readValue().data());
+                Log.infoln("The bulb is currently %s", bulb->poweredOn ? "on" : "off");
             }
 
-            if (!initBulbNotifications(pClient, powerStateChar)) {
+            if (!initBulbNotifications(pClient, bulb->powerStateChar)) {
                 Log.errorln("Failed to subscribe to power notifications for the bulb '%s'",
-                    pClient->getPeerAddress().toString().c_str());
+                    bulbAddress.c_str());
                 return false;
             }
         }
@@ -254,7 +293,7 @@ bool connectToBulb() {
         return false;
     }
 
-    return connected = true;
+    return bulb->connected = true;
 }
 
 void setup() {
@@ -262,6 +301,11 @@ void setup() {
     // Initialise with log level and log output.
     Log.begin(LOG_LEVEL, &Serial);
     Log.infoln("Starting Presence Detector");
+
+    // Init an entry in our map for every configured bulb
+    for (std::string bulb : BULB_MAC_ADDRESSES) {
+        bulbs.insert({ bulb, new BulbData() });
+    }
 
     // Configure the DFRobot sensor
     mySerial.begin(115200, SERIAL_8N1, RX, TX);
@@ -285,6 +329,13 @@ void setup() {
     NimBLEDevice::setPower(9); // +9db
 #endif
 
+    // Log currently bonded devices for debugging
+    Log.traceln("Current bonded devices: %d", NimBLEDevice::getNumBonds());
+    for (int i = 0; i < NimBLEDevice::getNumBonds(); i++) {
+        NimBLEAddress address = NimBLEDevice::getBondedAddress(i);
+        Log.traceln("Device %d: %s", i + 1, address.toString().c_str());
+    }
+
     // create new scan
     NimBLEScan* pScan = NimBLEDevice::getScan();
 
@@ -301,25 +352,33 @@ void setup() {
 }
 
 void loop() {
-    // Loop here until we find a bulb we want to connect to
-    while (!doConnect) {
-        delay(1);
-    }
-
-    // While we are connected to a bulb, toggle it on and off based on presence
-    while (connected) {
+    // If we are connected to at least one bulb, toggle it on and off based on presence
+    if (connectedBulbs > 0) {
         bool detected = sensor.readPresenceDetection();
-        if (detected != detectedState && !sensingPaused) {
+        if (detected != detectedState) {
             Log.infoln("Presence state changed, new state: %s", detected ? "Present" : "Absent");
-            changeBulbState(detectedState = detected);
+            // This will handle turning all of the connected bulbs on or off with appropriate handling
+            if (!changeBulbStates(detectedState = detected)) {
+                Log.errorln("There was an issue changing the state of at least one bulb");
+            }
         }
     }
 
-    // Found the bulb we want to connect to, do it now
-    if (connectToBulb()) {
-        Log.infoln("Success! We should now be able to control the bulb based on presence!");
-    } else {
-        Log.errorln("Failed to connect to the configured bulb, will resume scanning");
+    // Check if we have found a bulb to connect to
+    if (bulbToConnect != nullptr) {
+        // Attempt to connect to the bulb
+        if (connectToBulb(bulbToConnect)) {
+            Log.infoln("Successfully connected to the bulb '%s'! We should now be able to control the bulb based on presence!",
+                bulbToConnect->advDevice->getAddress().toString().c_str());
+        } else {
+            Log.errorln("Failed to connect to the bulb '%s'", bulbToConnect->advDevice->getAddress().toString().c_str());
+        }
+        bulbToConnect = nullptr;
+    }
+
+    // Check if we need to resume scanning
+    if (connectedBulbs != bulbs.size() && !NimBLEDevice::getScan()->isScanning()) {
+        Log.infoln("%d/%d bulbs are still unconnected, resuming scan", connectedBulbs, bulbs.size());
         NimBLEDevice::getScan()->start(SCAN_LENGTH);
     }
 }
