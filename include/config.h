@@ -26,14 +26,14 @@ const std::string BULB_MAC_ADDRESSES[2] = {
 
 // Configures the range at which the mmWave sensor starts and ends in meters (max 9m)
 const float SENSOR_DISTANCE_START = 0.0;
-const float SENSOR_DISTANCE_END = 4.0;
+const float SENSOR_DISTANCE_END = 6.0;
 
 /*
  Configures the latency of the mmWave sensor in seconds
  i.e. how long before the sensor starts/stops reporting presence.
 */
 const float SENSOR_PRESENCE_LATENCY = 0.0;
-const float SENSOR_ABSENCE_LATENCY = 5.0;
+const float SENSOR_ABSENCE_LATENCY = 10.0;
 
 /* 
  Enabling this stops the sensor from controlling a bulb if it detects that that bulb was turned on/off by something else.

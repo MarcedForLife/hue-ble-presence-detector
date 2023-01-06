@@ -12,6 +12,22 @@ Note that other ESP32s and mmWave sensors could be used with relatively small ch
 * [DFRobot mmWave Sensor (SEN0395)](https://wiki.dfrobot.com/mmWave_Radar_Human_Presence_Detection_SKU_SEN0395)
 * [Philips Hue BLE bulb](https://www.philips-hue.com/en-ca/p/hue-white-a19---e26-smart-bulb---75-w--4-pack-/046677563073)
 
+### Wiring
+For connecting the DFRobot mmWave SEN0395 to the UM TinyS3, I wired together the following pins:
+| SEN0395           | UM TinyS3   |
+|-------------------|-------------|
+| TX                | RX          |
+| RX                | TX          |
+| IO1               | -           |
+| IO2               | -           |
+| GND               | GND         |
+| V                 | 5V          |
+
+Note that, IO1 and IO2 are unused as you can configure and read from the sensor over UART.
+I used [this](https://github.com/DFRobotdl/DFRobot_mmWave_Radar) helper library from DFRobot to simplify the calls.
+
+If wiring a different ESP32 and/or sensor, please check your specific board and/or sensor pin diagrams.
+
 ## Setup
 This is a PlatformIO project that you should be able to clone, open, build and flash to your own hardware.
 Please see [the PlatformIO for VSCode instructions](https://platformio.org/install/ide?install=vscode) if you haven't used PlatformIO before.
