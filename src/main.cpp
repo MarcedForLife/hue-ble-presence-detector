@@ -19,8 +19,11 @@ const uint32_t SCAN_LENGTH = 0;
 static HardwareSerial mySerial(1);
 static DFRobot_mmWave_Radar sensor(&mySerial);
 
+// General state vars
 static bool detectedState = false;
+static bool sensorPaused = false;
 static int connectedBulbs = 0;
+static int pausedBulbs = 0;
 
 struct BulbData {
     NimBLEAdvertisedDevice* advDevice;
@@ -93,26 +96,28 @@ class AdvertisedDeviceCallbacks: public NimBLEAdvertisedDeviceCallbacks {
     }
 };
 
-// This will update our local variable for the bulb power state
-bool storeBulbState(std::string bulbAddress, const uint8_t* bulbData) {
-    bool poweredOn = bulbData[0] == 1;
-    bulbs.find(bulbAddress)->second->poweredOn = poweredOn;
-    return poweredOn;
+// Simple helper to get the power value for a bulb from the raw data
+bool getPoweredOn(const uint8_t* powerData) {
+    return powerData[0] == 1;
 }
 
 // Change the power state of the given bulb
 bool changeBulbState(BulbData* bulb, bool powerOn) {
     // Check the state of the bulb first, which shouldn't count as failure
     if (bulb->connected && !bulb->paused && powerOn != bulb->poweredOn) {
-        // These should all pass unless something is wrong
         NimBLERemoteCharacteristic* powerStateChar = bulb->powerStateChar;
         std::string bulbAddress = bulb->advDevice->getAddress().toString();
+        // For external control detection race conditions, store the state before actually updating
+        bulb->poweredOn = powerOn;
+        // These should all pass unless something is wrong
         if (powerStateChar && powerStateChar->canWrite() && powerStateChar->writeValue(powerOn ? byte(1) : byte(0))) {
             Log.noticeln("Turned the bulb '%s' %s", bulbAddress.c_str(), powerOn ? "on" : "off");
             return true;
         }
         Log.errorln("There was an issue changing the power characteristic for the bulb '%s'",
             bulbAddress.c_str());
+        // Since we updated our local state first, revert it
+        bulb->poweredOn = !powerOn;
         return false;
     }
     return true;
@@ -130,24 +135,40 @@ bool changeBulbStates(bool powerOn) {
     return allSucceeded;
 }
 
+/*
+ This handles checking whether or not a bulb should pause/resume and update the appropriate state.
+ Note that, this does not start or stop the sensor due to race conditions and the need for delay between commands.
+*/
+void evaluatePausing(BulbData* bulb, bool poweredOn) {
+    // Check if pausing is enabled and whether the bulb changed power state from something else
+    if (PAUSE_ON_EXTERNAL_CONTROL && bulb->poweredOn != poweredOn || bulb->paused) {
+        Log.infoln("The bulb was externally controlled and 'PAUSE_ON_EXTERNAL_CONTROL' was enabled.");
+        // Check if we should pause or resume
+        if (!bulb->paused) {
+            Log.infoln("Sensor control will be **paused** until we detect a second instance of external power control");
+            bulb->paused = true;
+            pausedBulbs++;
+        } else {
+            Log.infoln("Sensor control will **resume** as this is the second instance of external power control");
+            bulb->paused = false;
+            pausedBulbs--;
+        }
+    }
+}
+
 // Notification / Indication receiving handler callback
 void notifyCB(NimBLERemoteCharacteristic* pRemoteCharacteristic, uint8_t* pData, size_t length, bool isNotify) {
     if (pRemoteCharacteristic->getUUID().equals(POWER_STATE_CHAR_UUID)) {
         std::string bulbAddress = pRemoteCharacteristic->getRemoteService()->getClient()->getPeerAddress().toString();
         // We shouldn't ever get a notification for a non-configured bulb, so don't bother with safety checks
         BulbData* bulb = bulbs.find(bulbAddress)->second;
+        bool poweredOn = getPoweredOn(pData);
         Log.infoln("Received power state notification from bulb '%s'. The bulb is now %s",
-            bulbAddress.c_str(), storeBulbState(bulbAddress, pData) ? "on" : "off");
-        if (PAUSE_ON_EXTERNAL_CONTROL && bulb->poweredOn != detectedState || bulb->paused) {
-            Log.infoln("The bulb was externally controlled and 'PAUSE_ON_EXTERNAL_CONTROL' was enabled.");
-            if (!bulb->paused) {
-                Log.infoln("Sensor control will be **paused** until we detect a second instance of external power control");
-                bulb->paused = true;
-            } else {
-                Log.infoln("Sensor control will **resume** as this is the second instance of external power control");
-                bulb->paused = false;
-            }
-        }
+            bulbAddress.c_str(), poweredOn ? "on" : "off");
+        // Pause/Resume the bulb if enabled and the appropriate conditions are met
+        evaluatePausing(bulb, poweredOn);
+        // Make sure we store the current power state
+        bulb->poweredOn = poweredOn;
     } else {
         Log.infoln("Received an unknown notification from device '%s', service '%s' & characteristic '%s'. Value: '%u'",
             pRemoteCharacteristic->getRemoteService()->getClient()->getPeerAddress().toString().c_str(),
@@ -278,7 +299,7 @@ bool connectToBulb(BulbData* bulb) {
         bulb->powerStateChar = bulb->lightService->getCharacteristic(POWER_STATE_CHAR_UUID);
         if (bulb->powerStateChar) {
             if (bulb->powerStateChar->canRead()) {
-                storeBulbState(bulbAddress, bulb->powerStateChar->readValue().data());
+                bulb->poweredOn = getPoweredOn(bulb->powerStateChar->readValue().data());
                 Log.infoln("The bulb is currently %s", bulb->poweredOn ? "on" : "off");
             }
 
@@ -296,9 +317,21 @@ bool connectToBulb(BulbData* bulb) {
     return bulb->connected = true;
 }
 
+// Will pause the mmWave sensor
+void pauseSensor() {
+    sensor.stop();
+    sensorPaused = true;
+}
+
+// Will resume the mmWave sensor
+void resumeSensor() {
+    sensor.start();
+    sensorPaused = false;
+}
+
 void setup() {
     Serial.begin(115200);
-    // Initialise with log level and log output.
+    // Initialise with log level and log output
     Log.begin(LOG_LEVEL, &Serial);
     Log.infoln("Starting Presence Detector");
 
@@ -347,38 +380,66 @@ void setup() {
     pScan->setWindow(15);
     // Active scan will gather scan response data from advertisers but will use more energy from both devices
     pScan->setActiveScan(true);
-    // Start scanning for advertisers for the scan time specified (in seconds) 0 = forever
-    pScan->start(SCAN_LENGTH);
 }
 
+// TODO: This loop is gross and needs refactoring
 void loop() {
-    // If we are connected to at least one bulb, toggle it on and off based on presence
-    if (connectedBulbs > 0) {
-        bool detected = sensor.readPresenceDetection();
-        if (detected != detectedState) {
-            Log.infoln("Presence state changed, new state: %s", detected ? "Present" : "Absent");
-            // This will handle turning all of the connected bulbs on or off with appropriate handling
-            if (!changeBulbStates(detectedState = detected)) {
-                Log.errorln("There was an issue changing the state of at least one bulb");
+    // Since scanning is a blocking call, either handle connections or do presence detection
+    if (connectedBulbs != bulbs.size()) {
+        // Check if we need to start/resume scanning
+        if (!NimBLEDevice::getScan()->isScanning() && bulbToConnect == nullptr) {
+            Log.infoln("%d/%d bulbs are unconnected, resuming scan", connectedBulbs, bulbs.size());
+            // Scanning is a blocking call so we might as well pause sensor
+            pauseSensor();
+            NimBLEDevice::getScan()->start(SCAN_LENGTH);
+        }
+        // Check if we have found a bulb to connect to
+        if (bulbToConnect != nullptr) {
+            // Attempt to connect to the bulb
+            if (connectToBulb(bulbToConnect)) {
+                Log.infoln("Successfully connected to the bulb '%s'! We should now be able to control the bulb based on presence!",
+                    bulbToConnect->advDevice->getAddress().toString().c_str());
+            } else {
+                Log.errorln("Failed to connect to the bulb '%s'", bulbToConnect->advDevice->getAddress().toString().c_str());
+            }
+            bulbToConnect = nullptr;
+        }
+    } else { // All configured bulbs are connected
+        if (!sensorPaused) {
+            // Check whether we should stop the sensor if there is nothing to control
+            if (pausedBulbs == bulbs.size()) {
+                Log.infoln("Stopping the mmWave sensor as %s", connectedBulbs == 0
+                    ? "no bulbs are connected"
+                    : "every bulb is paused");
+                pauseSensor();
+            } else {
+                // Check presence and control any connected, unpaused bulbs
+                bool detected = sensor.readPresenceDetection();
+                if (detected != detectedState) {
+                    Log.infoln("Presence state changed, new state: %s", detected ? "Present" : "Absent");
+                    // This will handle turning all of the connected bulbs on or off with appropriate handling
+                    if (!changeBulbStates(detectedState = detected)) {
+                        Log.errorln("There was an issue changing the state of at least one bulb");
+                    }
+                }
+            }
+        } else {
+            // Check whether we should resume the sensor
+            if (pausedBulbs < bulbs.size()) {
+                Log.infoln("Resuming the mmWave sensor as there are valid bulbs to control");
+                resumeSensor();
+                /*
+                 Since the sensor has been paused, it will report no presence for a few seconds.
+                 To stop our logic from turning off bulbs in an occupied room, we wait to see if it
+                 detects presence for a maximum of 10 seconds before continuing and updating bulbs.
+                */
+                unsigned long startedWaiting = millis();
+                bool detectedState = false;
+                while(!detectedState && millis() - startedWaiting <= 10000) {
+                    detectedState = sensor.readPresenceDetection();
+                }
+                changeBulbStates(detectedState);
             }
         }
-    }
-
-    // Check if we have found a bulb to connect to
-    if (bulbToConnect != nullptr) {
-        // Attempt to connect to the bulb
-        if (connectToBulb(bulbToConnect)) {
-            Log.infoln("Successfully connected to the bulb '%s'! We should now be able to control the bulb based on presence!",
-                bulbToConnect->advDevice->getAddress().toString().c_str());
-        } else {
-            Log.errorln("Failed to connect to the bulb '%s'", bulbToConnect->advDevice->getAddress().toString().c_str());
-        }
-        bulbToConnect = nullptr;
-    }
-
-    // Check if we need to resume scanning
-    if (connectedBulbs != bulbs.size() && !NimBLEDevice::getScan()->isScanning()) {
-        Log.infoln("%d/%d bulbs are still unconnected, resuming scan", connectedBulbs, bulbs.size());
-        NimBLEDevice::getScan()->start(SCAN_LENGTH);
     }
 }
