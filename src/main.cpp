@@ -39,6 +39,11 @@ struct BulbData {
     bool paused;
 };
 
+struct BulbPowerChangeRequest {
+    BulbData* bulbData;
+    bool powerOn;
+};
+
 static std::map<std::string, BulbData*> bulbs;
 static BulbData* bulbToConnect;
 
@@ -119,7 +124,10 @@ bool getPoweredOn(const uint8_t* powerData) {
 }
 
 // Change the power state of the given bulb
-bool changeBulbState(BulbData* bulb, bool powerOn) {
+void changeBulbState(void* parameter) {
+    BulbPowerChangeRequest* request = (BulbPowerChangeRequest*) parameter;
+    BulbData* bulb = request->bulbData;
+    bool powerOn = request->powerOn;
     // Check the state of the bulb first, which shouldn't count as failure
     if (bulb->connected && !bulb->paused && powerOn != bulb->poweredOn) {
         NimBLERemoteCharacteristic* powerStateChar = bulb->powerStateChar;
@@ -129,25 +137,30 @@ bool changeBulbState(BulbData* bulb, bool powerOn) {
         // These should all pass unless something is wrong
         if (powerStateChar && powerStateChar->canWrite() && powerStateChar->writeValue(powerOn ? byte(1) : byte(0))) {
             Log.noticeln("Turned the bulb '%s' %s", bulbAddress.c_str(), powerOn ? "on" : "off");
-            return true;
+            // return true;
         }
         Log.errorln("There was an issue changing the power characteristic for the bulb '%s'",
             bulbAddress.c_str());
         // Since we updated our local state first, revert it
         bulb->poweredOn = !powerOn;
-        return false;
+        // return false;
     }
-    return true;
+    vTaskDelete(NULL);
+    // return true;
 }
 
 // Changes the power states for connected, non-paused bulbs
 bool changeBulbStates(bool powerOn) {
     bool allSucceeded = true;
     for (auto& bulb : bulbs) {
-        if (!changeBulbState(bulb.second, powerOn)) {
-            Log.errorln("Failed to power the bulb '%s' %s", bulb.first.c_str(), powerOn ? "on": "off");
-            allSucceeded = false;
-        }
+        BulbPowerChangeRequest request;
+        request.bulbData = bulb.second;
+        request.powerOn = powerOn;
+        xTaskCreate(changeBulbState, "Change bulb state", 2048, (void*) &request, 1, NULL);
+        // if (!changeBulbState(bulb.second, powerOn)) {
+        //     Log.errorln("Failed to power the bulb '%s' %s", bulb.first.c_str(), powerOn ? "on": "off");
+        //     allSucceeded = false;
+        // }
     }
     return allSucceeded;
 }
