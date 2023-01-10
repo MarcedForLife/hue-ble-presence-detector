@@ -15,6 +15,11 @@ static const NimBLEUUID POWER_STATE_CHAR_UUID = NimBLEUUID("932c32bd-0002-47a2-8
  However, if non-zero the current code will just start the scan again if there are unconnected bulbs.
 */
 const uint32_t SCAN_LENGTH = 0;
+/*
+ The maximum amount of time to wait for the mmWave sensor to resume in seconds.
+ This is helpful as the sensor reports no presence for a few seconds after resuming.
+*/
+const int SENSOR_RESUME_BUFFER = 10000;
 
 static HardwareSerial mySerial(1);
 static DFRobot_mmWave_Radar sensor(&mySerial);
@@ -329,6 +334,79 @@ void resumeSensor() {
     sensorPaused = false;
 }
 
+/*
+ This will scan for any of the configured bulbs and attempt to connect to one if found.
+ Since the NimBLE scanner is blocking, if no configured bulbs can be found it will scan forever.
+*/
+void connectToBulb() {
+    // Check if we need to start/resume scanning
+    if (!NimBLEDevice::getScan()->isScanning() && bulbToConnect == nullptr) {
+        Log.infoln("%d/%d bulbs are unconnected, resuming scan", connectedBulbs, bulbs.size());
+        // Scanning is a blocking call so we might as well pause sensor
+        pauseSensor();
+        NimBLEDevice::getScan()->start(SCAN_LENGTH);
+    }
+
+    // Check if we have found a bulb to connect to
+    if (bulbToConnect != nullptr) {
+        // Attempt to connect to the bulb
+        if (connectToBulb(bulbToConnect)) {
+            Log.infoln("Successfully connected to the bulb '%s'! We should now be able to control the bulb based on presence!",
+                bulbToConnect->advDevice->getAddress().toString().c_str());
+        } else {
+            Log.errorln("Failed to connect to the bulb '%s'", bulbToConnect->advDevice->getAddress().toString().c_str());
+        }
+        bulbToConnect = nullptr;
+    }
+}
+
+// This handles checking presence from the sensor and controlling unpaused bulbs
+void evaluatePresence() {
+    // Check presence from sensor and control any connected, unpaused bulbs
+    bool detected = sensor.readPresenceDetection();
+    if (detected != detectedState) {
+        Log.infoln("Presence state changed, new state: %s", detected ? "Present" : "Absent");
+        // This will handle turning all of the connected bulbs on or off with appropriate handling
+        if (!changeBulbStates(detectedState = detected)) {
+            Log.errorln("There was an issue changing the state of at least one bulb");
+        }
+    }
+}
+
+// This will evaluate whether or not we can use the mmWave sensor to detect presence
+bool canDetectPresence() {
+    if (!sensorPaused) {
+        // Check whether we should stop the sensor if there is nothing to control
+        if (pausedBulbs == bulbs.size()) {
+            Log.infoln("Stopping the mmWave sensor as every bulb is paused");
+            pauseSensor();
+            return false;
+        }
+        // The sensor is running and we can use it for presence detection
+        return true;
+    } else {
+        // Check whether we should resume the sensor
+        if (pausedBulbs < bulbs.size()) {
+            Log.infoln("Resuming the mmWave sensor as there are valid bulbs to control");
+            resumeSensor();
+            /*
+             Since the sensor has just started, it will report no presence for a few seconds.
+             To stop our logic from turning off bulbs in an occupied room, we wait to see if it
+             detects presence for our configured limit before continuing and updating bulbs.
+            */
+            unsigned long startedWaiting = millis();
+            bool detectedState = false;
+            while(!detectedState && millis() - startedWaiting <= SENSOR_RESUME_BUFFER) {
+                detectedState = sensor.readPresenceDetection();
+            }
+            changeBulbStates(detectedState);
+            return true;
+        }
+        // Sensor is still paused
+        return false;
+    }
+}
+
 void setup() {
     Serial.begin(115200);
     // Initialise with log level and log output
@@ -382,64 +460,14 @@ void setup() {
     pScan->setActiveScan(true);
 }
 
-// TODO: This loop is gross and needs refactoring
 void loop() {
-    // Since scanning is a blocking call, either handle connections or do presence detection
+    // The NimBLE scanner is blocking, so either handle connections or do presence detection
     if (connectedBulbs != bulbs.size()) {
-        // Check if we need to start/resume scanning
-        if (!NimBLEDevice::getScan()->isScanning() && bulbToConnect == nullptr) {
-            Log.infoln("%d/%d bulbs are unconnected, resuming scan", connectedBulbs, bulbs.size());
-            // Scanning is a blocking call so we might as well pause sensor
-            pauseSensor();
-            NimBLEDevice::getScan()->start(SCAN_LENGTH);
-        }
-        // Check if we have found a bulb to connect to
-        if (bulbToConnect != nullptr) {
-            // Attempt to connect to the bulb
-            if (connectToBulb(bulbToConnect)) {
-                Log.infoln("Successfully connected to the bulb '%s'! We should now be able to control the bulb based on presence!",
-                    bulbToConnect->advDevice->getAddress().toString().c_str());
-            } else {
-                Log.errorln("Failed to connect to the bulb '%s'", bulbToConnect->advDevice->getAddress().toString().c_str());
-            }
-            bulbToConnect = nullptr;
-        }
-    } else { // All configured bulbs are connected
-        if (!sensorPaused) {
-            // Check whether we should stop the sensor if there is nothing to control
-            if (pausedBulbs == bulbs.size()) {
-                Log.infoln("Stopping the mmWave sensor as %s", connectedBulbs == 0
-                    ? "no bulbs are connected"
-                    : "every bulb is paused");
-                pauseSensor();
-            } else {
-                // Check presence and control any connected, unpaused bulbs
-                bool detected = sensor.readPresenceDetection();
-                if (detected != detectedState) {
-                    Log.infoln("Presence state changed, new state: %s", detected ? "Present" : "Absent");
-                    // This will handle turning all of the connected bulbs on or off with appropriate handling
-                    if (!changeBulbStates(detectedState = detected)) {
-                        Log.errorln("There was an issue changing the state of at least one bulb");
-                    }
-                }
-            }
-        } else {
-            // Check whether we should resume the sensor
-            if (pausedBulbs < bulbs.size()) {
-                Log.infoln("Resuming the mmWave sensor as there are valid bulbs to control");
-                resumeSensor();
-                /*
-                 Since the sensor has been paused, it will report no presence for a few seconds.
-                 To stop our logic from turning off bulbs in an occupied room, we wait to see if it
-                 detects presence for a maximum of 10 seconds before continuing and updating bulbs.
-                */
-                unsigned long startedWaiting = millis();
-                bool detectedState = false;
-                while(!detectedState && millis() - startedWaiting <= 10000) {
-                    detectedState = sensor.readPresenceDetection();
-                }
-                changeBulbStates(detectedState);
-            }
-        }
+        // This will search for and connect to any configured bulb
+        connectToBulb();
+    }
+    // All configured bulbs are connected
+    else if (canDetectPresence()) {
+        evaluatePresence();
     }
 }
