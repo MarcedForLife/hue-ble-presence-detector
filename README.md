@@ -24,7 +24,7 @@ For connecting the DFRobot mmWave SEN0395 to the UM TinyS3, I wired together the
 | V                 | 5V          |
 
 Note that, IO1 and IO2 are unused as you can configure and read from the sensor over UART.
-I used [this](https://github.com/DFRobotdl/DFRobot_mmWave_Radar) helper library from DFRobot to simplify the calls.
+I use a simple fork of [this](https://github.com/DFRobotdl/DFRobot_mmWave_Radar) helper library from DFRobot to simplify the calls.
 
 If wiring a different ESP32 and/or sensor, please check your specific board and/or sensor pin diagrams.
 
