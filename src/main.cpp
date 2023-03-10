@@ -375,36 +375,27 @@ void evaluatePresence() {
 
 // This will evaluate whether or not we can use the mmWave sensor to detect presence
 bool canDetectPresence() {
-    if (!sensorPaused) {
-        // Check whether we should stop the sensor if there is nothing to control
-        if (pausedBulbs == bulbs.size()) {
-            Log.infoln("Stopping the mmWave sensor as every bulb is paused");
-            pauseSensor();
-            return false;
+    // Check whether the sensor should be stopped or started before returning the current state
+    if (!sensorPaused && pausedBulbs == bulbs.size()) {
+        Log.infoln("Stopping the mmWave sensor as every bulb is paused");
+        pauseSensor();
+    } else if (sensorPaused && pausedBulbs < bulbs.size()) {
+        Log.infoln("Resuming the mmWave sensor as there are valid bulbs to control");
+        resumeSensor();
+        /*
+         Since the sensor has just started, it will report no presence for a few seconds.
+         To stop our logic from turning off bulbs in an occupied room, we wait to see if it
+         detects presence for our configured limit before continuing and updating bulbs.
+        */
+        unsigned long startedWaiting = millis();
+        bool detectedState = false;
+        while(!detectedState && millis() - startedWaiting <= SENSOR_RESUME_BUFFER) {
+            detectedState = sensor.readPresenceDetection();
         }
-        // The sensor is running and we can use it for presence detection
-        return true;
-    } else {
-        // Check whether we should resume the sensor
-        if (pausedBulbs < bulbs.size()) {
-            Log.infoln("Resuming the mmWave sensor as there are valid bulbs to control");
-            resumeSensor();
-            /*
-             Since the sensor has just started, it will report no presence for a few seconds.
-             To stop our logic from turning off bulbs in an occupied room, we wait to see if it
-             detects presence for our configured limit before continuing and updating bulbs.
-            */
-            unsigned long startedWaiting = millis();
-            bool detectedState = false;
-            while(!detectedState && millis() - startedWaiting <= SENSOR_RESUME_BUFFER) {
-                detectedState = sensor.readPresenceDetection();
-            }
-            changeBulbStates(detectedState);
-            return true;
-        }
-        // Sensor is still paused
-        return false;
+        changeBulbStates(detectedState);
     }
+    // Return the current state of the sensor
+    return !sensorPaused;
 }
 
 void setup() {
